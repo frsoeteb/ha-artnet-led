@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import socket
+import select
+from struct import pack
+import threading
+from threading import Event
+
 import asyncio
 import logging
 import time
 from array import array
 from typing import Union
 
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+
+
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.color as color_util
 import pyartnet
+from pyartnet.base import BaseNode
+from pyartnet.errors import InvalidUniverseAddressError
+
 import voluptuous as vol
+
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_RGB_COLOR,
@@ -23,8 +39,21 @@ from homeassistant.components.light import (
     COLOR_MODE_RGBWW,
     SUPPORT_TRANSITION,
     PLATFORM_SCHEMA,
-    LightEntity, COLOR_MODE_ONOFF, COLOR_MODE_WHITE, ATTR_WHITE, ATTR_COLOR_TEMP_KELVIN, SUPPORT_FLASH, ATTR_FLASH,
-    FLASH_SHORT, FLASH_LONG, COLOR_MODE_HS, ATTR_HS_COLOR)
+    LightEntity,
+    COLOR_MODE_ONOFF,
+    COLOR_MODE_WHITE,
+    ATTR_WHITE,
+    ATTR_COLOR_TEMP_KELVIN,
+    SUPPORT_FLASH,
+    ATTR_FLASH,
+    FLASH_SHORT,
+    FLASH_LONG,
+    COLOR_MODE_HS,
+    ATTR_HS_COLOR,
+)
+
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
 from homeassistant.const import CONF_DEVICES, STATE_OFF, STATE_ON
 from homeassistant.const import CONF_FRIENDLY_NAME as CONF_DEVICE_FRIENDLY_NAME
 from homeassistant.const import CONF_HOST as CONF_NODE_HOST
@@ -40,7 +69,11 @@ from pyartnet.errors import UniverseNotFoundError
 
 from custom_components.artnet_led.bridge.artnet_controller import ArtNetController
 from custom_components.artnet_led.bridge.channel_bridge import ChannelBridge
-from custom_components.artnet_led.util.channel_switch import validate, to_values, from_values
+from custom_components.artnet_led.util.channel_switch import (
+    validate,
+    to_values,
+    from_values,
+)
 
 ARTNET_DEFAULT_PORT = 6454
 SACN_DEFAULT_PORT = 5568
@@ -69,22 +102,31 @@ CONF_DEVICE_MIN_TEMP = "min_temp"
 CONF_DEVICE_MAX_TEMP = "max_temp"
 CONF_CHANNEL_SETUP = "channel_setup"
 
+EVENT_DMX_VALUE_SET = "DMX_on"
+EVENT_DMX_VALUE_UNSET = "DMX_off"
+
 DOMAIN = "dmx"
 
-AVAILABLE_CORRECTIONS = {"linear": pyartnet.output_correction.linear, "quadratic": pyartnet.output_correction.quadratic,
-                         "cubic": pyartnet.output_correction.cubic, "quadruple": pyartnet.output_correction.quadruple}
+AVAILABLE_CORRECTIONS = {
+    "linear": pyartnet.output_correction.linear,
+    "quadratic": pyartnet.output_correction.quadratic,
+    "cubic": pyartnet.output_correction.cubic,
+    "quadruple": pyartnet.output_correction.quadruple,
+}
 
 CHANNEL_SIZE = {
     "8bit": (1, 1),
     "16bit": (2, 256),
-    "24bit": (3, 256 ** 2),
-    "32bit": (4, 256 ** 3),
+    "24bit": (3, 256**2),
+    "32bit": (4, 256**3),
 }
 
 NODES = {}
 
 
-async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant, config, async_add_devices, discovery_info=None
+):
     pyartnet.base.CREATE_TASK = hass.async_create_task
 
     client_type = config.get(CONF_NODE_TYPE)
@@ -115,7 +157,7 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
                 max_fps=max_fps,
                 refresh_every=refresh_interval,
                 start_refresh_task=(refresh_interval > 0),
-                sequence_counter=True
+                sequence_counter=True,
             )
             NODES[id] = __node
 
@@ -123,7 +165,9 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
 
     elif client_type == "artnet-controller":
         if "server" not in NODES:
-            __node = ArtNetController(hass, max_fps=max_fps, refresh_every=refresh_interval)
+            __node = ArtNetController(
+                hass, max_fps=max_fps, refresh_every=refresh_interval
+            )
             NODES["server"] = __node
             __node.start()
         node = NODES["server"]
@@ -140,7 +184,7 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
                 max_fps=max_fps,
                 refresh_every=refresh_interval,
                 start_refresh_task=(refresh_interval > 0),
-                source_name="ha-artnet-led"
+                source_name="ha-artnet-led",
             )
             NODES[id] = __node
 
@@ -162,6 +206,20 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
 
         node = NODES[id]
 
+    elif client_type == "artnet-cuno":
+        if real_port is None:
+            real_port = ARTNET_DEFAULT_PORT
+        if "CUNO" not in NODES:
+            __node = CUNOGateway(
+                hass,
+                real_host,
+                real_port,
+                max_fps=max_fps,
+                refresh_every=refresh_interval,
+            )
+            NODES["CUNO"] = __node
+            __node.start()
+        node = NODES["CUNO"]
     else:
         raise NotImplementedError(f"Unknown client type '{client_type}'")
 
@@ -194,8 +252,13 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
             # If the entity has another unique ID, use that until it's migrated properly
             entity = entity_registry.async_get(entity_id)
             if entity:
-                log.info(f"Found existing entity for name {entity_id}, using unique id {unique_id}")
-                if entity.unique_id is not None and entity.unique_id not in used_unique_ids:
+                log.info(
+                    f"Found existing entity for name {entity_id}, using unique id {unique_id}"
+                )
+                if (
+                    entity.unique_id is not None
+                    and entity.unique_id not in used_unique_ids
+                ):
                     unique_id = entity.unique_id
             used_unique_ids.append(unique_id)
 
@@ -289,16 +352,18 @@ class DmxBaseLight(LightEntity, RestoreEntity):
     @property
     def extra_state_attributes(self):
         # TODO extra_state_attributes really shouldn't have lots of changing values like this, it pollutes the DB
-        data = {"type": self._type,
-                "dmx_channels": [
-                    k for k in range(
-                        self._channel._start, self._channel._start + self._channel._width, 1
-                    )
-                ],
-                "dmx_values": self._channel.get_values(),
-                "values": self._vals,
-                "bright": self._attr_brightness
-                }
+        data = {
+            "type": self._type,
+            "dmx_channels": [
+                k
+                for k in range(
+                    self._channel._start, self._channel._start + self._channel._width, 1
+                )
+            ],
+            "dmx_values": self._channel.get_values(),
+            "values": self._vals,
+            "bright": self._attr_brightness,
+        }
         self._channel_last_update = time.time()
         return data
 
@@ -359,7 +424,11 @@ class DmxBaseLight(LightEntity, RestoreEntity):
 
         flash_time = kwargs.get(ATTR_FLASH)
 
-        if old_state and old_values == self._vals and old_brightness == self._attr_brightness:
+        if (
+            old_state
+            and old_values == self._vals
+            and old_brightness == self._attr_brightness
+        ):
             if self._attr_brightness < 128:
                 self._attr_brightness = 255
             else:
@@ -387,9 +456,7 @@ class DmxBaseLight(LightEntity, RestoreEntity):
 
         transition = kwargs.get(ATTR_TRANSITION, self._fade_time)
 
-        self._channel.set_fade(
-            self.get_target_values(), transition * 1000
-        )
+        self._channel.set_fade(self.get_target_values(), transition * 1000)
 
         self.async_schedule_update_ha_state()
 
@@ -401,8 +468,7 @@ class DmxBaseLight(LightEntity, RestoreEntity):
         transition = kwargs.get(ATTR_TRANSITION, self._fade_time)
 
         self._channel.set_fade(
-            [0 for _ in range(self._channel._width)],
-            transition * 1000
+            [0 for _ in range(self._channel._width)], transition * 1000
         )
 
         self._state = False
@@ -413,7 +479,7 @@ class DmxBaseLight(LightEntity, RestoreEntity):
         await super().async_added_to_hass()
         old_state = await self.async_get_last_state()
         if old_state:
-            old_type = old_state.attributes.get('type')
+            old_type = old_state.attributes.get("type")
             if old_type != self._type:
                 log.debug("Channel type changed. Unable to restore state.")
                 old_state = None
@@ -422,7 +488,9 @@ class DmxBaseLight(LightEntity, RestoreEntity):
             await self.restore_state(old_state)
 
     async def restore_state(self, old_state):
-        log.error("Derived class should implement this. Report this to the repository author.")
+        log.error(
+            "Derived class should implement this. Report this to the repository author."
+        )
 
     @property
     def channel_width(self):
@@ -447,7 +515,12 @@ class DmxFixed(DmxBaseLight):
         self._channel_width = len(self._channel_setup)
 
     def get_target_values(self):
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+        )
 
     def set_channel(self, channel: pyartnet.base.Channel):
         super().set_channel(channel)
@@ -460,7 +533,9 @@ class DmxFixed(DmxBaseLight):
         pass  # do nothing, fixed is constant value
 
     async def restore_state(self, old_state):
-        log.debug("Added fixed to hass. Do nothing to restore state. Fixed is constant value")
+        log.debug(
+            "Added fixed to hass. Do nothing to restore state. Fixed is constant value"
+        )
         await super().async_create_fade()
 
 
@@ -475,7 +550,9 @@ class DmxBinary(DmxBaseLight):
         self._color_mode = COLOR_MODE_ONOFF
 
     def _update_values(self, values: array[int]):
-        self._state, _, _, _, _, _, _, color_temp = from_values("d", self.channel_size[1], values)
+        self._state, _, _, _, _, _, _, color_temp = from_values(
+            "d", self.channel_size[1], values
+        )
 
         self._channel_value_change()
 
@@ -495,36 +572,28 @@ class DmxBinary(DmxBaseLight):
 
         self._state = True
         self._attr_brightness = 255
-        self._channel.set_fade(
-            self.get_target_values(), 0
-        )
+        self._channel.set_fade(self.get_target_values(), 0)
         self.async_schedule_update_ha_state()
 
     async def flash_binary(self, duration: float):
         self._state = not self._state
         self._attr_brightness = 255 if self._state else 0
-        self._channel.set_fade(
-            self.get_target_values(), 0
-        )
+        self._channel.set_fade(self.get_target_values(), 0)
         await asyncio.sleep(duration)
         self._state = not self._state
         self._attr_brightness = 255 if self._state else 0
-        self._channel.set_fade(
-            self.get_target_values(), 0
-        )
+        self._channel.set_fade(self.get_target_values(), 0)
 
     async def async_turn_off(self, **kwargs):
         self._state = False
         self._attr_brightness = 0
-        self._channel.set_fade(
-            self.get_target_values(), 0
-        )
+        self._channel.set_fade(self.get_target_values(), 0)
         self.async_schedule_update_ha_state()
 
     async def restore_state(self, old_state):
         log.debug("Added binary light to hass. Try restoring state.")
         self._state = old_state.state
-        self._attr_brightness = old_state.attributes.get('bright')
+        self._attr_brightness = old_state.attributes.get("bright")
 
         if old_state.state == STATE_ON:
             await self.async_turn_on()
@@ -545,16 +614,21 @@ class DmxDimmer(DmxBaseLight):
         validate(self._channel_setup, self.CONF_TYPE)
 
     def _update_values(self, values: array[int]):
-        self._state, self._attr_brightness, _, _, _, _, _, _ = \
-            from_values(self._channel_setup, self.channel_size[1], values)
+        self._state, self._attr_brightness, _, _, _, _, _, _ = from_values(
+            self._channel_setup, self.channel_size[1], values
+        )
 
         self._channel_value_change()
 
     def get_target_values(self):
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+        )
 
     async def async_turn_on(self, **kwargs):
-
         # Update state from service call
         if ATTR_BRIGHTNESS in kwargs:
             self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
@@ -565,11 +639,13 @@ class DmxDimmer(DmxBaseLight):
         log.debug("Added dimmer to hass. Try restoring state.")
 
         if old_state:
-            prev_brightness = old_state.attributes.get('bright')
+            prev_brightness = old_state.attributes.get("bright")
             self._attr_brightness = prev_brightness
 
         if old_state.state != STATE_OFF:
-            await super().async_create_fade(brightness=self._attr_brightness, transition=0)
+            await super().async_create_fade(
+                brightness=self._attr_brightness, transition=0
+            )
 
 
 class DmxWhite(DmxBaseLight):
@@ -609,18 +685,27 @@ class DmxWhite(DmxBaseLight):
         return self._max_kelvin
 
     def _update_values(self, values: array[int]):
-        self._state, self._attr_brightness, _, _, _, _, _, color_temp = from_values(self._channel_setup,
-                                                                                    self.channel_size[1], values,
-                                                                                    self._min_kelvin, self._max_kelvin)
+        self._state, self._attr_brightness, _, _, _, _, _, color_temp = from_values(
+            self._channel_setup,
+            self.channel_size[1],
+            values,
+            self._min_kelvin,
+            self._max_kelvin,
+        )
         self._vals = color_temp
 
         self._channel_value_change()
 
     def get_target_values(self):
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness,
-                         color_temp_kelvin=self.color_temp_kelvin,
-                         min_kelvin=self.min_color_temp_kelvin,
-                         max_kelvin=self.max_color_temp_kelvin)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+            color_temp_kelvin=self.color_temp_kelvin,
+            min_kelvin=self.min_color_temp_kelvin,
+            max_kelvin=self.max_color_temp_kelvin,
+        )
 
     async def async_turn_on(self, **kwargs):
         """
@@ -651,13 +736,15 @@ class DmxWhite(DmxBaseLight):
         log.debug("Added color_temp to hass. Try restoring state.")
 
         if old_state:
-            prev_vals = old_state.attributes.get('values')
+            prev_vals = old_state.attributes.get("values")
             self._vals = prev_vals
-            prev_brightness = old_state.attributes.get('bright')
+            prev_brightness = old_state.attributes.get("bright")
             self._attr_brightness = prev_brightness
 
         if old_state.state != STATE_OFF:
-            await super().async_create_fade(brightness=self._attr_brightness, rgb_color=self._vals, transition=0)
+            await super().async_create_fade(
+                brightness=self._attr_brightness, rgb_color=self._vals, transition=0
+            )
 
 
 class DmxRGB(DmxBaseLight):
@@ -676,7 +763,9 @@ class DmxRGB(DmxBaseLight):
 
         self._channel_width = len(self._channel_setup)
 
-        self._auto_scale_white = "w" in self._channel_setup or "W" in self._channel_setup
+        self._auto_scale_white = (
+            "w" in self._channel_setup or "W" in self._channel_setup
+        )
 
     @property
     def rgb_color(self) -> tuple:
@@ -684,8 +773,9 @@ class DmxRGB(DmxBaseLight):
         return self._vals
 
     def _update_values(self, values: array[int]):
-        self._state, self._attr_brightness, red, green, blue, _, _, _ = \
-            from_values(self._channel_setup, self.channel_size[1], values)
+        self._state, self._attr_brightness, red, green, blue, _, _, _ = from_values(
+            self._channel_setup, self.channel_size[1], values
+        )
 
         self._vals = (red, green, blue)
 
@@ -701,9 +791,16 @@ class DmxRGB(DmxBaseLight):
         else:
             white = -1
 
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness, red, green,
-                         blue,
-                         white)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+            red,
+            green,
+            blue,
+            white,
+        )
 
     async def async_turn_on(self, **kwargs):
         """
@@ -735,13 +832,15 @@ class DmxRGB(DmxBaseLight):
         log.debug("Added rgb to hass. Try restoring state.")
 
         if old_state:
-            prev_vals = old_state.attributes.get('values')
+            prev_vals = old_state.attributes.get("values")
             self._vals = prev_vals
-            prev_brightness = old_state.attributes.get('bright')
+            prev_brightness = old_state.attributes.get("bright")
             self._attr_brightness = prev_brightness
 
         if old_state.state != STATE_OFF:
-            await super().async_create_fade(brightness=self._attr_brightness, rgb_color=self._vals, transition=0)
+            await super().async_create_fade(
+                brightness=self._attr_brightness, rgb_color=self._vals, transition=0
+            )
 
 
 class DmxRGBW(DmxBaseLight):
@@ -766,8 +865,9 @@ class DmxRGBW(DmxBaseLight):
         return tuple(self._vals)
 
     def _update_values(self, values: array[int]):
-        self._state, self._attr_brightness, red, green, blue, white, _, _ = \
-            from_values(self._channel_setup, self.channel_size[1], values)
+        self._state, self._attr_brightness, red, green, blue, white, _, _ = from_values(
+            self._channel_setup, self.channel_size[1], values
+        )
 
         self._vals = (red, green, blue, white)
 
@@ -779,9 +879,16 @@ class DmxRGBW(DmxBaseLight):
         blue = self._vals[2]
         white = self._vals[3]
 
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness, red, green,
-                         blue,
-                         white)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+            red,
+            green,
+            blue,
+            white,
+        )
 
     async def async_turn_on(self, **kwargs):
         """
@@ -813,14 +920,16 @@ class DmxRGBW(DmxBaseLight):
         log.debug("Added rgbw to hass. Try restoring state.")
 
         if old_state:
-            prev_vals = old_state.attributes.get('values')
+            prev_vals = old_state.attributes.get("values")
             self._vals = prev_vals
 
-            prev_brightness = old_state.attributes.get('bright')
+            prev_brightness = old_state.attributes.get("bright")
             self._attr_brightness = prev_brightness
 
         if old_state.state != STATE_OFF:
-            await super().async_create_fade(brightness=self._attr_brightness, rgbw_color=self._vals, transition=0)
+            await super().async_create_fade(
+                brightness=self._attr_brightness, rgbw_color=self._vals, transition=0
+            )
 
 
 class DmxRGBWW(DmxBaseLight):
@@ -837,7 +946,14 @@ class DmxRGBWW(DmxBaseLight):
         # Intentionally switching min and max here; it's inverted in the conversion.
         self._min_kelvin = convert_to_kelvin(kwargs[CONF_DEVICE_MIN_TEMP])
         self._max_kelvin = convert_to_kelvin(kwargs[CONF_DEVICE_MAX_TEMP])
-        self._vals = [255, 255, 255, 255, 255, (self._max_kelvin - self._min_kelvin) / 2]
+        self._vals = [
+            255,
+            255,
+            255,
+            255,
+            255,
+            (self._max_kelvin - self._min_kelvin) / 2,
+        ]
 
         self._channel_setup = kwargs.get(CONF_CHANNEL_SETUP) or "rgbch"
         validate(self._channel_setup, self.CONF_TYPE)
@@ -845,8 +961,16 @@ class DmxRGBWW(DmxBaseLight):
         self._channel_width = len(self._channel_setup)
 
     def _update_values(self, values: array[int]):
-        self._state, self._attr_brightness, red, green, blue, cold_white, warm_white, color_temp = \
-            from_values(self._channel_setup, self.channel_size[1], values)
+        (
+            self._state,
+            self._attr_brightness,
+            red,
+            green,
+            blue,
+            cold_white,
+            warm_white,
+            color_temp,
+        ) = from_values(self._channel_setup, self.channel_size[1], values)
 
         self._vals = (red, green, blue, cold_white, warm_white, color_temp)
 
@@ -879,11 +1003,20 @@ class DmxRGBWW(DmxBaseLight):
         warm_white = self._vals[4]
         color_temperature_kelvin = self._vals[5]
 
-        return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness,
-                         red, green, blue, cold_white, warm_white,
-                         color_temp_kelvin=color_temperature_kelvin,
-                         min_kelvin=self.min_color_temp_kelvin,
-                         max_kelvin=self.max_color_temp_kelvin)
+        return to_values(
+            self._channel_setup,
+            self._channel_size[1],
+            self.is_on,
+            self._attr_brightness,
+            red,
+            green,
+            blue,
+            cold_white,
+            warm_white,
+            color_temp_kelvin=color_temperature_kelvin,
+            min_kelvin=self.min_color_temp_kelvin,
+            max_kelvin=self.max_color_temp_kelvin,
+        )
 
     async def async_turn_on(self, **kwargs):
         """
@@ -898,8 +1031,15 @@ class DmxRGBWW(DmxBaseLight):
 
             if self._vals[3] != old_values[3] or self._vals[4] != old_values[4]:
                 self._vals[5], _ = color_util.rgbww_to_color_temperature(
-                    (self._vals[0], self._vals[1], self._vals[2], self._vals[3], self._vals[4]),
-                    self.min_color_temp_kelvin, self.max_color_temp_kelvin
+                    (
+                        self._vals[0],
+                        self._vals[1],
+                        self._vals[2],
+                        self._vals[3],
+                        self._vals[4],
+                    ),
+                    self.min_color_temp_kelvin,
+                    self.max_color_temp_kelvin,
                 )
                 self._channel_value_change()
 
@@ -912,8 +1052,18 @@ class DmxRGBWW(DmxBaseLight):
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._vals[5] = kwargs[ATTR_COLOR_TEMP_KELVIN]
-            _, _, _, self._vals[3], self._vals[4] = color_util.color_temperature_to_rgbww(
-                self._vals[5], self._attr_brightness, self.min_color_temp_kelvin, self.max_color_temp_kelvin)
+            (
+                _,
+                _,
+                _,
+                self._vals[3],
+                self._vals[4],
+            ) = color_util.color_temperature_to_rgbww(
+                self._vals[5],
+                self._attr_brightness,
+                self.min_color_temp_kelvin,
+                self.max_color_temp_kelvin,
+            )
             self._channel_value_change()
 
         if ATTR_FLASH in kwargs:
@@ -927,14 +1077,213 @@ class DmxRGBWW(DmxBaseLight):
         log.debug("Added rgbww to hass. Try restoring state.")
 
         if old_state:
-            prev_vals = old_state.attributes.get('values')
+            prev_vals = old_state.attributes.get("values")
             self._vals = prev_vals
 
-            prev_brightness = old_state.attributes.get('bright')
+            prev_brightness = old_state.attributes.get("bright")
             self._attr_brightness = prev_brightness
 
         if old_state.state != STATE_OFF:
-            await super().async_create_fade(brightness=self._attr_brightness, rgbww_color=self._vals, transition=0)
+            await super().async_create_fade(
+                brightness=self._attr_brightness, rgbww_color=self._vals, transition=0
+            )
+
+
+#######
+class CUNOGateway(BaseNode["pyartnet.impl_artnet.CUNOUniverse"]):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        ip: str,
+        port: int,
+        max_fps: int = 25,
+        refresh_every: Union[int, float, None] = 2,
+        start_refresh_task: bool = True,
+    ):
+        super().__init__(
+            ip="0.0.0.0",  # fake ip
+            port=port,
+            max_fps=max_fps,
+            refresh_every=refresh_every,
+        )
+
+        self._communicator = TCPCommunicator(hass, ip, port)
+        self._communicator.start()
+        self._dmxcnt = 0
+        self._hass = hass
+        # build base packet
+        packet = bytearray()
+        packet.extend(map(ord, "Art-Net"))
+        packet.append(0x00)  # Null terminate Art-Net
+        packet.extend([0x00, 0x50])  # Opcode ArtDMX 0x5000 (Little endian)
+        packet.extend([0x00, 0x0E])  # Protocol version 14
+        self._packet_base = bytes(packet)
+
+    def _send_data(self, data: Union[bytearray, bytes]) -> int:
+        """
+        Send the current state of DMX values to the CUNO gateway via cmd.
+        """
+        curdmxcnt = 0
+        # Copy the base packet then add the channel array
+        for i in range(0, self._number_of_channels - 1):
+            value = self._channels[i]
+            if value != 0:
+                log.debug("Setting CUNO channel %i to %i", i, value)
+            if (i < self._number_of_channels) and (0 <= value <= 255):
+                cmd = "Dw{:02X}{:02X}\n".format(i, value)
+                self._communicator.send(cmd)
+                if value > 0:
+                    curdmxcnt += 1
+
+        if curdmxcnt == 0 and curdmxcnt != self._dmxcnt:
+            log.debug("DMX channel count is 0")
+            self._hass.bus.fire(EVENT_DMX_VALUE_UNSET, {})
+        elif curdmxcnt > 0 and self._dmxcnt == 0:
+            log.debug("DMX channel count got from 0 to %d", curdmxcnt)
+            self._hass.bus.fire(EVENT_DMX_VALUE_SET, {})
+        else:
+            log.debug("DMX channel count with non zero values = %d", curdmxcnt)
+
+        self._dmxcnt = curdmxcnt
+
+    def _send_universe(
+        self,
+        id: int,
+        byte_size: int,
+        values: bytearray,
+        universe: "pyartnet.impl_artnet.ArtNetUniverse",
+    ):
+        log.debug("create universe")
+
+    def _create_universe(self, nr: int) -> "pyartnet.impl_artnet.ArtNetUniverse":
+        if nr >= 32_768:
+            raise InvalidUniverseAddressError()
+        return pyartnet.impl_artnet.ArtNetUniverse(self, nr)
+
+
+#       log.debug(out)
+
+
+class TCPCommunicator(threading.Thread):
+    """
+    Communicator base-class
+    Not to be used directly
+    """
+
+    _logger = logging.getLogger("artnet.TCPCommunicator")
+
+    def __init__(self, hass: HomeAssistant, host, port):
+        super(TCPCommunicator, self).__init__()
+        self._host = host
+        self._port = port
+        self._socket = None
+        self.__event = Event()
+        # Create an event to stop the thread
+        self._stop_flag = threading.Event()
+        # Input buffer
+        self._buffer = []
+        # Setup packet queues
+        self.transmit = queue.Queue()
+        self.receive = queue.Queue()
+        self._inputs = []
+        self._outputs = []
+        ev = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.stop)
+        ev()
+
+    def send(self, channelval):
+        if not isinstance(channelval, str):
+            self._logger.error("Object to send must be an instance of string")
+            return False
+        self.transmit.put(channelval)
+        if self._socket not in self._outputs:
+            self._outputs.append(self._socket)
+        return True
+
+    def connect(self):
+        if self._socket is None:
+            try:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # TCP
+            except socket.error as msg:
+                self._socket = None
+                self._logger.error("could not open socket  %s", msg)
+            if self._socket:
+                try:  #
+                    self._socket.settimeout(5)
+                    self._socket.connect((self._host, self._port))
+                except socket.error as msg:
+                    self._socket.close()
+                    self._socket = None
+                    self._logger.error("could not connect socket  %s", msg)
+
+            if self._socket:
+                self._inputs.append(self._socket)
+                self._outputs.append(self._socket)
+            else:
+                self._logger.error(
+                    "could not open socket with host %s and port %s",
+                    self._host,
+                    repr(self._port),
+                )
+
+        return self._socket
+
+    def run(self):
+        while not self._stop_flag.is_set():
+            if not self.connect():
+                self.__event.wait(1.0)
+            else:
+                if len(self._inputs) > 0:
+                    #    self.__event.wait(0.1)
+                    try:
+                        readable, writable, exceptional = select.select(
+                            self._inputs, self._outputs, [], 1.0
+                        )
+                        if self._socket in readable:
+                            data = self._socket.recv(1024)
+                            if data:
+                                self._logger.debug("data received %s", data)
+                            else:
+                                # Interpret empty result as closed connection
+                                self._logger.error(
+                                    "closing socket after reading no data"
+                                )
+                                # Stop listening for input on the connection
+                                if self._socket in self._outputs:
+                                    self._outputs.remove(self._socket)
+                                self._inputs.remove(self._socket)
+                                self._socket.close()
+
+                        if self._socket in writable:
+                            try:
+                                data = self.transmit.get(block=False)
+                            except queue.Empty:
+                                # No messages waiting so stop checking for writability.
+                                self._logger.debug("output queue is empty")
+                                self._outputs.remove(self._socket)
+                            else:
+                                self._logger.debug("sending CUNO command %s" % data)
+                                self._socket.send(data.encode("utf-8"))
+
+                        # Handle "exceptional conditions"
+                        if self._socket in exceptional:
+                            self._logger.error(
+                                "handling exceptional condition for socklet"
+                            )
+                            # Stop listening for input on the connection
+                            self._inputs.remove(self._socket)
+                            if self._socket in self._outputs:
+                                self._outputs.remove(self._socket)
+                            self._socket.close()
+                    except (socket.error, TypeError) as msg:
+                        self._logger.error("could not select socket  %s", msg)
+                        self._socket.close()
+                        self._socket = None
+                        self._inputs.clear()
+                        self._outputs.clear()
+                        self.__event.wait(1.0)
+
+    def stop(self):
+        self._stop_flag.set()
 
 
 # ------------------------------------------------------------------------------
@@ -950,7 +1299,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_NODE_UNIVERSES): {
             vol.All(int, vol.Range(min=0, max=1024)): {
                 vol.Optional(CONF_SEND_PARTIAL_UNIVERSE, default=True): cv.boolean,
-                vol.Optional(CONF_OUTPUT_CORRECTION, default='linear'): vol.Any(
+                vol.Optional(CONF_OUTPUT_CORRECTION, default="linear"): vol.Any(
                     None, vol.In(AVAILABLE_CORRECTIONS)
                 ),
                 CONF_DEVICES: vol.All(
@@ -962,33 +1311,33 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
                             ),
                             vol.Required(CONF_DEVICE_NAME): cv.string,
                             vol.Optional(CONF_DEVICE_FRIENDLY_NAME): cv.string,
-                            vol.Optional(CONF_DEVICE_TYPE, default='dimmer'): vol.In(
+                            vol.Optional(CONF_DEVICE_TYPE, default="dimmer"): vol.In(
                                 [k.CONF_TYPE for k in __CLASS_LIST]
                             ),
                             vol.Optional(CONF_DEVICE_TRANSITION, default=0): vol.All(
                                 vol.Coerce(float), vol.Range(min=0, max=999)
                             ),
-                            vol.Optional(CONF_OUTPUT_CORRECTION, default='linear'): vol.Any(
-                                None, vol.In(AVAILABLE_CORRECTIONS)
-                            ),
-                            vol.Optional(CONF_CHANNEL_SIZE, default='8bit'): vol.Any(
+                            vol.Optional(
+                                CONF_OUTPUT_CORRECTION, default="linear"
+                            ): vol.Any(None, vol.In(AVAILABLE_CORRECTIONS)),
+                            vol.Optional(CONF_CHANNEL_SIZE, default="8bit"): vol.Any(
                                 None, vol.In(CHANNEL_SIZE)
                             ),
-                            vol.Optional(CONF_BYTE_ORDER, default='big'): vol.Any(
-                                None, vol.In(['little', 'big'])
+                            vol.Optional(CONF_BYTE_ORDER, default="big"): vol.Any(
+                                None, vol.In(["little", "big"])
                             ),
-                            vol.Optional(CONF_DEVICE_MIN_TEMP, default='2700K'): vol.Match(
-                                "\\d+(k|K)"
-                            ),
-                            vol.Optional(CONF_DEVICE_MAX_TEMP, default='6500K'): vol.Match(
-                                "\\d+(k|K)"
-                            ),
+                            vol.Optional(
+                                CONF_DEVICE_MIN_TEMP, default="2700K"
+                            ): vol.Match("\\d+(k|K)"),
+                            vol.Optional(
+                                CONF_DEVICE_MAX_TEMP, default="6500K"
+                            ): vol.Match("\\d+(k|K)"),
                             vol.Optional(CONF_CHANNEL_SETUP, default=None): vol.Any(
                                 None, cv.string, cv.ensure_list
                             ),
                         }
                     ],
-                )
+                ),
             },
         },
         vol.Optional(CONF_NODE_HOST_OVERRIDE, default=""): cv.string,
@@ -1001,7 +1350,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
             vol.Coerce(int), vol.Range(min=0, max=9999)
         ),
         vol.Optional(CONF_NODE_TYPE, default="artnet-direct"): vol.Any(
-            None, vol.In(["artnet-direct", "artnet-controller", "sacn", "kinet"])
+            None,
+            vol.In(
+                ["artnet-direct", "artnet-controller", "sacn", "kinet", "artnet-cuno"]
+            ),
         ),
     },
     required=True,
