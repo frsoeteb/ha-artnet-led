@@ -218,7 +218,6 @@ async def async_setup_platform(
                 refresh_every=refresh_interval,
             )
             NODES["CUNO"] = __node
-            __node.start()
         node = NODES["CUNO"]
     else:
         raise NotImplementedError(f"Unknown client type '{client_type}'")
@@ -1089,7 +1088,6 @@ class DmxRGBWW(DmxBaseLight):
             )
 
 
-#######
 class CUNOGateway(BaseNode["pyartnet.impl_artnet.CUNOUniverse"]):
     def __init__(
         self,
@@ -1124,15 +1122,16 @@ class CUNOGateway(BaseNode["pyartnet.impl_artnet.CUNOUniverse"]):
         Send the current state of DMX values to the CUNO gateway via cmd.
         """
         curdmxcnt = 0
+        channel = 0
         # Copy the base packet then add the channel array
-        for i in range(0, self._number_of_channels - 1):
-            value = self._channels[i]
-            if value != 0:
-                log.debug("Setting CUNO channel %i to %i", i, value)
-            if (i < self._number_of_channels) and (0 <= value <= 255):
-                cmd = "Dw{:02X}{:02X}\n".format(i, value)
+        for val in data:
+            if val != 0:
+                log.debug("Setting CUNO channel %i to %i", channel, val)
+            if 0 <= val <= 255:
+                cmd = "Dw{:02X}{:02X}\n".format(channel, val)
                 self._communicator.send(cmd)
-                if value > 0:
+                channel += 1
+                if val > 0:
                     curdmxcnt += 1
 
         if curdmxcnt == 0 and curdmxcnt != self._dmxcnt:
@@ -1153,7 +1152,7 @@ class CUNOGateway(BaseNode["pyartnet.impl_artnet.CUNOUniverse"]):
         values: bytearray,
         universe: "pyartnet.impl_artnet.ArtNetUniverse",
     ):
-        log.debug("create universe")
+        self._send_data(values)
 
     def _create_universe(self, nr: int) -> "pyartnet.impl_artnet.ArtNetUniverse":
         if nr >= 32_768:
